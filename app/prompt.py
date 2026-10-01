@@ -22,7 +22,22 @@ from app.state import Conversation, OfferedSlot
 DEFAULT_TZ = ZoneInfo("America/Mexico_City")
 
 
-def _chassis(profile: BusinessProfile) -> str:
+STORE_BLOCK = """
+
+MODO TIENDA (este negocio VENDE PRODUCTOS por WhatsApp; esto manda sobre lo de agendar y calificar):
+- Tu trabajo es atender y TOMAR PEDIDOS: entender qué busca, recomendar del catálogo aprobado, armar el pedido y registrarlo. No hay citas.
+- Precios, stock y nombres de productos salen de buscar_productos (el catálogo EN VIVO de la tienda online): eso es conocimiento aprobado y manda sobre cualquier precio escrito en otro lado. Consúltala antes de dar un precio o recomendar, y nunca des un precio que no te haya devuelto.
+- Recomienda solo productos que existan en el catálogo, con su precio exacto. Si algo dice SIN STOCK, no lo vendas: ofrece la alternativa más parecida que sí haya. Si preguntan por un sabor, tamaño o producto que no está en el catálogo, dilo con honestidad (no lo inventes).
+- Si el cliente no sabe qué elegir, haz UNA pregunta útil (objetivo: ganar masa, definir, rendir más, recuperarse; presupuesto) y sugiere 1-3 opciones concretas.
+- Para cerrar el pedido necesitas: productos y cantidades, nombre, si es ENVÍO o RETIRO, dirección y ciudad/barrio si es envío, y la forma de pago (de las que acepta el negocio). Pídelo de a una cosa por mensaje.
+- ANTES de registrar, manda UN resumen claro: cada producto con cantidad y precio, total, entrega y pago, y pregunta "¿Confirmo tu pedido?". Solo con un sí explícito llamas registrar_pedido.
+- Tras registrar_pedido, confirma con el NÚMERO de pedido y el TOTAL que te devolvió la herramienta (no tu cuenta) y explica el siguiente paso según las políticas del negocio (envío, pago, tiempos). Si la herramienta falla, NO digas que quedó registrado: haz handoff.
+- Si pregunta por un pedido que ya hizo, usa consultar_pedidos y dile su estado real.
+- Cambios o cancelación de un pedido ya registrado, reclamos o devoluciones: handoff.
+- Datos que SÍ pides en este modo: nombre, dirección de entrega y forma de pago (el método, p. ej. transferencia o efectivo). NUNCA pidas números de tarjeta, claves ni datos bancarios del cliente."""
+
+
+def _chassis(profile: BusinessProfile, store: bool = False) -> str:
     name = profile.agent_name
     text = f"""Eres {name}, el agente de IA de WhatsApp de este negocio. Atiendes a personas que escriben al número del negocio. Tu trabajo: entender qué necesita cada persona, calificarla según las instrucciones del negocio y AGENDAR una cita con el equipo cuando corresponda — o darle una salida digna cuando no.
 
@@ -90,6 +105,23 @@ MULTIMEDIA (los marcadores [entre corchetes] NO los escribió el lead — son de
 - Ubicación → reconócela sin repetir coordenadas; si revela su zona/ciudad, guárdala en la ficha (geo).
 - Video o contenido que NO pudiste abrir → honestidad total: dile que aún no puedes verlo y ofrécele que te lo cuente en texto o nota de voz. JAMÁS finjas haber visto o escuchado algo que no tienes transcrito.
 - Nunca menciones "transcripción", "sistema", "marcadores", "adjunto" ni nada técnico — para el lead, simplemente entendiste su mensaje."""
+    if store:
+        text = text.replace(
+            "Tu trabajo: entender qué necesita cada persona, calificarla según las instrucciones del negocio y AGENDAR una cita con el equipo cuando corresponda — o darle una salida digna cuando no.",
+            "Tu trabajo: entender qué necesita cada persona, recomendarle productos del catálogo y TOMAR SU PEDIDO hasta dejarlo registrado.",
+        )
+        text = text.replace(
+            "- Pidas datos sensibles (pagos, contraseñas). Solo contacto e info de calificación.",
+            "- Pidas datos sensibles (números de tarjeta, claves, datos bancarios). Solo contacto, datos de entrega y la forma de pago.",
+        )
+        text = text.replace(
+            "- handoff: al decidir pasar a humano (o si no puedes resolver algo).",
+            "- handoff: al decidir pasar a humano (o si no puedes resolver algo).\n"
+            "- registrar_pedido: solo tras el resumen y un sí explícito del cliente.\n"
+            "- consultar_pedidos: cuando pregunta por un pedido que ya hizo.\n"
+            "- buscar_productos: antes de dar precios, recomendar o armar un pedido.",
+        )
+        text += STORE_BLOCK
     if profile.cloud:
         text = text.replace("calificarla según las instrucciones del negocio y AGENDAR", "resolver las dudas necesarias y AGENDAR")
         text = text.replace("saluda transparente + un gancho de valor + UNA pregunta abierta", "saluda transparente y atiende su petición; pregunta solo lo necesario")
@@ -303,6 +335,7 @@ def build_system_prompt(
     now: datetime | None = None,
     tz: ZoneInfo | None = None,
     recordatorios: bool = False,
+    store: bool = False,
 ) -> str:
     """Chasis + perfil del negocio + bloque de contexto vivo de esta conversación.
 
@@ -312,7 +345,11 @@ def build_system_prompt(
     tz = tz or DEFAULT_TZ
     now = now or datetime.now(timezone.utc)
     lines: list[str] = ["", "CONTEXTO ACTUAL:"]
-    if not agenda:
+    if not agenda and store:
+        lines.append(
+            "- No hay agenda de citas: aquí se toman PEDIDOS (ver MODO TIENDA)."
+        )
+    elif not agenda:
         # El CRM de esta instancia no agenda (Vocero trae el motor detrás de
         # una bandera). Sin esto el agente sigue prometiendo cita y el lead se
         # topa con una puerta cerrada al final de la conversación.
@@ -383,7 +420,7 @@ def build_system_prompt(
     lines.extend(_booking_lines((context or {}).get("booking"), now))
 
     return (
-        _chassis(profile)
+        _chassis(profile, store)
         + "\n\n"
         + _business_block(profile)
         + "\n"

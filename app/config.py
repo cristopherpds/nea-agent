@@ -164,6 +164,12 @@ class Settings(BaseSettings):
 
     history_window: int = 10
 
+    # Modo tienda (fork Maxima Suplementos): con ORDERS_URL el agente toma
+    # pedidos y los registra en el panel de pedidos en vez de agendar citas.
+    # Vacía = Nea de siempre.
+    orders_url: str = ""
+    orders_api_key: str = ""
+
     # Cada cuántos segundos, como mucho, se le vuelve a preguntar al CRM si
     # agenda (la bandera AGENDA de Vocero). Antes se preguntaba solo al
     # arrancar: encenderla exigía reiniciar Nea. La pregunta la hace el primer
@@ -247,6 +253,11 @@ class Settings(BaseSettings):
         en vez de dejar que se descubra con un cliente esperando respuesta.
         """
         return bool(self.llm_base_url) and self.llm_transcribe_model == "whisper-1"
+
+    @property
+    def store_mode(self) -> bool:
+        """¿Toma pedidos (panel de pedidos configurado)?"""
+        return bool(self.orders_url.strip())
 
     @property
     def multi_org(self) -> bool:

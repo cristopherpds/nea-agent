@@ -17,6 +17,7 @@ import logging
 from datetime import date, datetime, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
+import httpx
 
 from app.crm import (
     AgendaUnavailable,
@@ -215,8 +216,79 @@ AGENDA_V2_SCHEMAS = [
 # Herramientas que solo tienen sentido si el CRM agenda.
 AGENDA_TOOLS = frozenset({"propose_slots", "book_session", "reschedule_session"})
 
+# Modo tienda (fork Maxima Suplementos): pedidos al panel de pedidos.
+ORDER_SCHEMAS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "buscar_productos",
+            "description": (
+                "Busca en el catálogo EN VIVO de la tienda online: nombre exacto, precio "
+                "actual en pesos uruguayos, stock y descripción. Úsala SIEMPRE antes de "
+                "dar un precio, recomendar o armar un pedido. consulta = palabras clave "
+                "(p. ej. 'whey chocolate', 'creatina', 'hipercalorico', 'pre entreno')."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"consulta": {"type": "string"}},
+                "required": ["consulta"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "registrar_pedido",
+            "description": (
+                "Registra el pedido del cliente en el panel de pedidos del negocio. "
+                "Llámala SOLO después de mostrarle el resumen (productos, cantidades, "
+                "precios, total, entrega y pago) y recibir un sí explícito. Solo "
+                "productos y precios que estén en el conocimiento del negocio. "
+                "El total lo calcula el sistema: úsalo tal cual te lo regrese."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "nombre_cliente": {"type": "string"},
+                    "items": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "producto": {"type": "string", "description": "Nombre exacto del catálogo, con sabor/tamaño si aplica"},
+                                "cantidad": {"type": "integer", "minimum": 1},
+                                "precio_unitario": {"type": "number", "description": "Precio del catálogo en pesos uruguayos"},
+                            },
+                            "required": ["producto", "cantidad", "precio_unitario"],
+                        },
+                    },
+                    "entrega": {"type": "string", "enum": ["envio", "retiro"]},
+                    "direccion": {"type": "string", "description": "Calle, número y apartamento (solo si es envío)"},
+                    "ciudad": {"type": "string", "description": "Ciudad o barrio y departamento"},
+                    "metodo_pago": {"type": "string", "description": "Cómo va a pagar (según las formas de pago del negocio)"},
+                    "notas": {"type": "string"},
+                },
+                "required": ["nombre_cliente", "items", "entrega", "metodo_pago"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "consultar_pedidos",
+            "description": "Consulta los pedidos de este cliente y su estado (nuevo, preparando, enviado, entregado, cancelado).",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+]
 
-def tool_schemas(agenda_enabled: bool = True, agenda_v2: bool = False, coordination: bool = False) -> list[dict[str, Any]]:
+
+def tool_schemas(agenda_enabled: bool = True, agenda_v2: bool = False, coordination: bool = False, store: bool = False) -> list[dict[str, Any]]:
+    base = _tool_schemas(agenda_enabled, agenda_v2, coordination)
+    return base + ORDER_SCHEMAS if store else base
+
+
+def _tool_schemas(agenda_enabled: bool = True, agenda_v2: bool = False, coordination: bool = False) -> list[dict[str, Any]]:
     """El catálogo que se le ofrece al modelo en ESTE turno.
 
     Contra un CRM sin agenda no se le enseñan las herramientas de agendar: si
@@ -404,6 +476,14 @@ class ToolRuntime:
                 if args.get("confirmation") is not True or not args.get("selection_token"):
                     return {"ok": False, "error": "confirmation_required"}
                 return await self._ctx.crm.cancel_booking(self._crm_conv_id, str(args["selection_token"]), True)
+            if name == "registrar_pedido":
+                return await self._registrar_pedido(args)
+            if name == "consultar_pedidos":
+                return await self._consultar_pedidos()
+            if name == "buscar_productos":
+                return await self._orders(
+                    "GET", "/api/catalogo/buscar", params={"q": str(args.get("consulta") or "")}
+                )
             if name == "update_ficha":
                 return await self._update_ficha(args)
             if name == "propose_slots":
@@ -425,6 +505,58 @@ class ToolRuntime:
                 "error": "crm_error",
                 "detalle": "no pude completar la acción; continúa la conversación o haz handoff",
             }
+
+    async def _orders(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+        settings = self._ctx.settings
+        if not settings.store_mode:
+            return {"ok": False, "error": "sin_panel_de_pedidos"}
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.request(
+                    method,
+                    settings.orders_url.rstrip("/") + path,
+                    headers={"X-API-Key": settings.orders_api_key},
+                    **kwargs,
+                )
+            data = resp.json() if resp.content else {}
+        except (httpx.HTTPError, ValueError) as exc:
+            logger.warning("tools: panel de pedidos no respondió: %s", exc)
+            return {
+                "ok": False,
+                "error": "panel_caido",
+                "detalle": "no se pudo registrar; NO digas que quedó registrado: haz handoff",
+            }
+        if resp.status_code >= 400:
+            logger.warning("tools: panel de pedidos %s → %s %s", path, resp.status_code, data)
+            return {"ok": False, "error": data.get("error", f"http_{resp.status_code}"), "detalle": data.get("detalle")}
+        return {"ok": True, **data}
+
+    async def _registrar_pedido(self, args: dict[str, Any]) -> dict[str, Any]:
+        items = [i for i in (args.get("items") or []) if isinstance(i, dict)]
+        if not items:
+            return {"ok": False, "error": "pedido_vacio", "detalle": "pregunta qué productos quiere"}
+        body = {
+            **{k: v for k, v in args.items() if k != "items" and v not in (None, "")},
+            "items": items,
+            "telefono": self._conv.wa_identity,
+            "conversation_id": self._crm_conv_id,
+        }
+        result = await self._orders("POST", "/api/pedidos", json=body)
+        if result.get("ok") and result.get("numero"):
+            resumen = f"#{result['numero']} · ${result.get('total')} UYU · {result.get('estado', 'nuevo')}"
+            try:
+                await self._ctx.crm.put_ficha(
+                    self._crm_conv_id,
+                    {"ultimo_pedido": resumen, "nombre": args.get("nombre_cliente"), "geo": args.get("ciudad")},
+                )
+            except CrmError:
+                pass  # el pedido ya quedó; la ficha es cortesía
+        return result
+
+    async def _consultar_pedidos(self) -> dict[str, Any]:
+        return await self._orders(
+            "GET", "/api/pedidos/cliente", params={"telefono": self._conv.wa_identity}
+        )
 
     async def _update_ficha(self, args: dict[str, Any]) -> dict[str, Any]:
         # Tolera el drift del LLM: manda lo que haya, el CRM normaliza flojo.

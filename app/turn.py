@@ -590,6 +590,7 @@ async def run_turn(
         agenda=ctx.agenda_enabled,
         tz=_agent_tz(settings),
         recordatorios=bool(getattr(ctx.crm, "supports_agenda_v2", False)),
+        store=settings.store_mode,
     )
     # Se traen más mensajes de los que ve el LLM: el candado de cierre cuenta
     # el hilo COMPLETO del lead, no solo la ventana de contexto.
@@ -940,7 +941,7 @@ async def _tool_loop(
     """
     for _ in range(MAX_TOOL_ROUNDS):
         reply = await ctx.llm.complete(
-            messages, tools=tool_schemas(ctx.agenda_enabled, bool(getattr(ctx.crm, "supports_agenda_v2", False)), bool(getattr(ctx.crm, "supports_coordination", False)))
+            messages, tools=tool_schemas(ctx.agenda_enabled, bool(getattr(ctx.crm, "supports_agenda_v2", False)), bool(getattr(ctx.crm, "supports_coordination", False)), store=ctx.settings.store_mode)
         )
         if not reply.tool_calls:
             return reply.content  # turno de puro texto
