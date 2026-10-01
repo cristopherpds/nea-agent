@@ -19,7 +19,6 @@ y su webhook de Meta sigue siendo el de siempre.
 """
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import hmac
 import json
@@ -31,6 +30,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
 from app.multiorg import organizacion_del_despacho
+from app.http_limits import limited_body
 from app.state import AppContext, InboundMessage
 from app.turn import handle_flush
 
@@ -38,7 +38,6 @@ logger = logging.getLogger("nea.dispatch")
 
 router = APIRouter()
 
-_bg_tasks: set[asyncio.Task[Any]] = set()
 
 
 def firma_valida(body: bytes, header: str | None, secret: str) -> bool:
@@ -48,10 +47,8 @@ def firma_valida(body: bytes, header: str | None, secret: str) -> bool:
     diferencia y la firma no coincide nunca. Es el error clásico de esta clase
     de integración, y por eso se valida antes de parsear nada.
 
-    Sin secreto configurado se RECHAZA. Es lo contrario de lo que hace el
-    webhook de Meta —donde un secreto vacío significa "dev, no verifiques"—, y
-    la diferencia es deliberada: aquí el secreto es la única prueba de que
-    quien despacha es el CRM y no cualquiera que conozca la URL.
+    Sin secreto configurado se RECHAZA, igual que en el webhook de Meta.
+    La firma prueba que quien despacha conoce la credencial del CRM.
     """
     if not secret or not header:
         return False
@@ -92,13 +89,12 @@ def mensajes_del_despacho(payload: dict[str, Any]) -> list[InboundMessage]:
 
 @router.post("/vocero/dispatch")
 async def recibir(request: Request) -> Any:
-    """Acusa recibo YA y procesa fuera de la ruta.
+    """Confirma el ACK después de persistir; el worker procesa fuera de la ruta.
 
-    El CRM reintenta con backoff si tardamos, así que responder rápido no es
-    una optimización: es lo que evita procesar el mismo mensaje tres veces.
+    Los reintentos se deduplican en PostgreSQL por organización y dispatchId.
     """
     ctx: AppContext = request.app.state.ctx
-    body = await request.body()
+    body = await limited_body(request)
 
     if not firma_valida(
         body,
@@ -118,13 +114,32 @@ async def recibir(request: Request) -> Any:
     if not isinstance(payload, dict):
         return JSONResponse({"error": "cuerpo inesperado"}, status_code=400)
 
-    task = asyncio.create_task(_procesar(ctx, payload))
-    _bg_tasks.add(task)
-    task.add_done_callback(_bg_tasks.discard)
+    try:
+        valid = (isinstance(payload.get("dispatchId"), str) and 0 < len(payload["dispatchId"]) <= 128
+            and isinstance(payload.get("conversation"), dict) and isinstance(payload["conversation"].get("id"), str)
+            and 0 < len(payload["conversation"]["id"]) <= 128
+            and isinstance(payload.get("contact"), dict) and isinstance(payload["contact"].get("identity"), str)
+            and isinstance(payload.get("messages"), list) and 0 < len(payload["messages"]) <= 100
+            and isinstance(payload.get("organization", {}), dict))
+        if payload.get("expiresAt"):
+            from datetime import datetime
+            expiry = datetime.fromisoformat(payload["expiresAt"].replace("Z", "+00:00"))
+            valid = valid and expiry.tzinfo is not None
+    except (ValueError, TypeError, AttributeError):
+        valid = False
+    org = organizacion_del_despacho(payload) if valid else None
+    if not valid or (ctx.settings.multi_org and org is None):
+        return JSONResponse({"error": "despacho inválido"}, status_code=422)
+    try:
+        await ctx.store.enqueue_dispatch(org[0] if org else ctx.settings.crm_organization, payload)
+    except Exception:
+        logger.exception("no se pudo persistir el despacho")
+        return JSONResponse({"error": "almacenamiento indisponible"}, status_code=503)
+    ctx.dispatch_wake.set()
     return {"status": "ok"}
 
 
-async def _procesar(ctx: AppContext, payload: dict[str, Any]) -> None:
+async def _procesar(ctx: AppContext, payload: dict[str, Any], *, durable: bool = False) -> None:
     dispatch_id = str(payload.get("dispatchId") or "")
     conversation = payload.get("conversation") or {}
     conversation_id = str(conversation.get("id") or "")
@@ -138,7 +153,7 @@ async def _procesar(ctx: AppContext, payload: dict[str, Any]) -> None:
     # Dedup por despacho, no por mensaje: el CRM reintenta el DESPACHO entero
     # cuando no le acusamos recibo, y contar sus mensajes uno por uno dejaría
     # pasar el segundo intento con la mitad de la ráfaga ya marcada.
-    if dispatch_id:
+    if dispatch_id and not durable:
         fresco = await ctx.store.mark_processed(f"dsp:{dispatch_id}")
         if not fresco:
             logger.info("dedup: despacho %s ya procesado — ignorado", dispatch_id)
@@ -172,7 +187,8 @@ async def _procesar(ctx: AppContext, payload: dict[str, Any]) -> None:
     # conversación que el CRM despachó, para que la red de seguridad del turno
     # sepa a quién pasársela si revienta antes de leer el contexto.
     await handle_flush(
-        ctx_turno, identity, mensajes, crm_conversation_id=conversation_id
+        ctx_turno, identity, mensajes, crm_conversation_id=conversation_id,
+        propagate_errors=durable,
     )
 
 
@@ -260,3 +276,4 @@ async def _a_humano(cliente: Any, conversation_id: str, motivo: str) -> None:
         await cliente.post_handoff(conversation_id, motivo)
     except Exception:
         logger.exception("no pude marcar %s para humano", conversation_id)
+        raise
